@@ -9,3 +9,6 @@ edition = "2018"
 [dependencies]
 pgn-reader = "0.15.0"
 histogram = "0.6.9"
+clap = "2.33.0"
+regex = "1"
+lazy_static = "1.4.0"

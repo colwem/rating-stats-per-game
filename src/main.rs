@@ -1,53 +1,107 @@
 use std::error::Error;
 use pgn_reader::{Visitor, RawHeader, Skip, BufferedReader};
-use std::env;
 use std::fs::File;
 use histogram::Histogram;
-use std::convert::From;
-use std::io::Write;
+use std::io::{self, Write, Read};
+use clap::{Arg, App};
+use regex::Regex;
+use std::ops::Range;
 
-#[derive(Default)]
+#[macro_use] 
+extern crate lazy_static;
+
 struct RatingPool {
     histogram: Histogram,
-    name: &'static str
+    perf_type: PerfType
 }
 
-struct Ratings<'a> {
+struct PerfType {
+    name: &'static str,
+    speed: Range<u64>
+}
+
+struct Ratings {
     rating_pools: Vec<RatingPool>,
-    pool: Option<&'a RatingPool>,
+    pool: Option<usize>,
     white_rating: Option<u64>,
-    black_rating: Option<u64>
+    black_rating: Option<u64>,
+    games_skipped: usize,
+    casual: usize,
+    rated: bool,
 }
 
-impl<'a> Default for Ratings<'a> {
+impl Default for Ratings {
     fn default() -> Self {
-        Ratings::new(&["ultrabullet", "bullet", "blitz", "rapid", "classical"])
+        Ratings::new(
+            Box::new([PerfType {name: "ultrabullet", speed: 0..30}, 
+            PerfType {name: "bullet", speed: 30..180},
+            PerfType {name: "blitz", speed: 180..480},
+            PerfType {name: "rapid", speed: 480..1500},
+            PerfType {name: "classical", speed: 1500..21600}]))
     }
 }
 
-impl<'a> Ratings<'a> {
-    fn new(pool_names: &[&'static str]) -> Ratings<'a> {
-        let rating_pools: Vec<RatingPool> = pool_names.iter()
-            .map(|name| RatingPool { name, ..Default::default() })
-            .collect();
+impl Ratings {
+    fn new(perf_types: Box<[PerfType]>) -> Ratings {
+        let mut rating_pools: Vec<RatingPool> = Vec::new();
+        for perf_type in perf_types.into_iter() {
+            rating_pools.push(
+                RatingPool { 
+                    histogram: Histogram::configure()
+                        .max_value(3500)
+                        .build()
+                        .unwrap(),
+                    perf_type: perf_type
+                });
+        }
         
         Ratings { 
             rating_pools: rating_pools,
             pool: None,
             white_rating: None,
-            black_rating: None
+            black_rating: None,
+            games_skipped: 0,
+            casual: 0,
+            rated: false,
         }
     }
 
-    fn set_pool(&'a mut self, event_text: &str) {
-        let event_text_lower = event_text.to_lowercase();
-        for pool in &self.rating_pools {
-            if event_text_lower.contains(pool.name) {
-                self.pool = Some(&pool);
-                return ();
+
+    fn set_pool(&mut self, timecontrol_text: &str) {
+        lazy_static! {
+            static ref re: Regex = Regex::new(r"(?P<initial>\d+)\+(?P<increment>\d+)").unwrap();
+        }
+        if let Some(caps) = re.captures(timecontrol_text) {
+            let initial = caps
+                .name("initial").unwrap().as_str()
+                .parse::<u64>().unwrap();
+            let increment = caps
+                .name("increment").unwrap().as_str()
+                .parse::<u64>().unwrap();
+            let total = initial + 40 * increment;
+            for (i, pool) in self.rating_pools.into_iter().enumerate() {
+                if pool.perf_type.speed.contains(&total) {
+                    self.pool = Some(i);
+                    return;
+                }
             }
         }
+        println!("Skipped");
+        println!("{}", timecontrol_text);
         self.pool = None;
+    }
+
+    fn set_rated(&mut self, event: &str) {
+        let event_lower = event.to_lowercase();
+        let casual_words = ["casual", "simul"];
+        for word in &casual_words {
+            if event.contains(word) {
+                self.rated = false;
+                self.casual += 1;
+                return
+            }
+        }
+        self.rated = true;
     }
 
     fn set_black_rating(&mut self, rating: &str) {
@@ -59,14 +113,15 @@ impl<'a> Ratings<'a> {
     }
 
     fn parse_rating(rating: &str) -> Option<u64> {
-        if rating.ends_with("?") {
-            return None;
-        }
-        return rating.parse::<u64>().ok();
+        let new_rating: String = rating.chars()
+            .filter(|c| c.is_numeric())
+            .collect();
+        println!("parsing: before {}, after {}", rating, new_rating);
+        return new_rating.parse::<u64>().ok();
     }
 }
 
-impl<'a> Visitor for Ratings<'a> {
+impl Visitor for Ratings {
     type Result = ();
 
     fn begin_headers(&mut self) {
@@ -77,24 +132,27 @@ impl<'a> Visitor for Ratings<'a> {
 
     fn header(&mut self, key: &[u8], value: RawHeader<'_>) {
         match key {
-            b"Event" => self.set_pool(&value.decode_utf8().unwrap()),
-            b"White Rating" => self.set_white_rating(&value.decode_utf8().unwrap()),
-            b"Black Rating" => self.set_black_rating(&value.decode_utf8().unwrap()),
+            b"Event" => self.set_rated(&value.decode_utf8().unwrap()),
+            b"WhiteElo" => self.set_white_rating(&value.decode_utf8().unwrap()),
+            b"BlackElo" => self.set_black_rating(&value.decode_utf8().unwrap()),
+            b"TimeControl" => self.set_pool(&value.decode_utf8().unwrap()),
             _ => ()
         }
     }
 
     fn end_headers(&mut self) -> Skip {
-        match &self.pool {
-            Some(pool) => {
+        match self.pool {
+            Some(pool) =>  {
                 if let Some(rating) = self.white_rating {
-                    pool.histogram.increment(rating).unwrap();
+                    self.rating_pools[pool]
+                        .histogram.increment(rating).unwrap();
                 }
                 if let Some(rating) = self.black_rating {
-                    pool.histogram.increment(rating).unwrap();
+                    self.rating_pools[pool]
+                        .histogram.increment(rating).unwrap();
                 }
             },
-            None => ()
+            None => self.games_skipped = self.games_skipped + 1
         }
         Skip(true)
     }
@@ -108,23 +166,42 @@ impl<'a> Visitor for Ratings<'a> {
 
 fn main() -> Result<(), Box<dyn Error>> {
 
-    let args: Vec<String> = env::args().collect();
-    let filename = &args[1];
-    println!("{}", filename);
-    let file = File::open(filename)?;
-    let mut reader = BufferedReader::new(file);
+    let matches = App::new("Pgn thing")
+        .version("0.0.0")
+        .author("Martin Colwell <colwem@gmail.com>")
+        .arg(Arg::with_name("file")
+             .short("f")
+             .long("file")
+             .takes_value(true)
+             .help("A pgn file"))
+        .get_matches();
+
+    let input: Box<dyn Read> = match matches.value_of("file") {
+        Some(file_name) => Box::new(File::open(file_name)?),
+        None => Box::new(io::stdin())
+    };
+    let mut reader = BufferedReader::new(input);
     let mut ratings = Ratings::default();
     reader.read_all(&mut ratings)?;
-    for rating_pool in ratings.rating_pools {
-        println!("{}: mean {}, stddev {}", 
-                 rating_pool.name, 
-                 rating_pool.histogram.mean().unwrap(), 
-                 rating_pool.histogram.stddev().unwrap());
+    for rating_pool in ratings.rating_pools.into_iter() {
+        println!("{}: total {}, mean {}, stddev {}", 
+                 rating_pool.perf_type.name, 
+                 rating_pool.histogram.entries(),
+                 rating_pool.histogram.mean()
+                     .and_then(|v| Ok(v.to_string()))
+                     .unwrap_or(String::from("No games")),
+                 rating_pool.histogram.stddev()
+                     .and_then(|v| Some(v.to_string()))
+                     .unwrap_or(String::from("No games")));
 
-        let mut out: File = File::create(format!("{}.data", rating_pool.name)).unwrap();
-        for bin in rating_pool.histogram.into_iter() {
-            out.write(format!("{}, {}", bin.value(), bin.count()).as_bytes()).unwrap();
-        }
+        let mut out: File = File::create(format!("{}.csv", rating_pool.perf_type.name)).unwrap();
+        rating_pool.histogram.into_iter()
+            .filter(|bin| bin.count() > 0)
+            .for_each(|bin| {
+                out.write(format!("{},{}\n", bin.value(), bin.count()).as_bytes()).unwrap();
+            });
     }
+    println!("Skipped: {}", ratings.games_skipped);
+    println!("Casual: {}", ratings.casual);
     Ok(())
 }
