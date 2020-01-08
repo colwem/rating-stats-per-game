@@ -33,16 +33,16 @@ struct Ratings {
 impl Default for Ratings {
     fn default() -> Self {
         Ratings::new(
-            Box::new([PerfType {name: "ultrabullet", speed: 0..30}, 
+            vec!(PerfType {name: "ultrabullet", speed: 0..30}, 
             PerfType {name: "bullet", speed: 30..180},
             PerfType {name: "blitz", speed: 180..480},
             PerfType {name: "rapid", speed: 480..1500},
-            PerfType {name: "classical", speed: 1500..21600}]))
+            PerfType {name: "classical", speed: 1500..21600}))
     }
 }
 
 impl Ratings {
-    fn new(perf_types: Box<[PerfType]>) -> Ratings {
+    fn new(perf_types: Vec<PerfType>) -> Ratings {
         let mut rating_pools: Vec<RatingPool> = Vec::new();
         for perf_type in perf_types.into_iter() {
             rating_pools.push(
@@ -69,9 +69,9 @@ impl Ratings {
 
     fn set_pool(&mut self, timecontrol_text: &str) {
         lazy_static! {
-            static ref re: Regex = Regex::new(r"(?P<initial>\d+)\+(?P<increment>\d+)").unwrap();
+            static ref RE: Regex = Regex::new(r"(?P<initial>\d+)\+(?P<increment>\d+)").unwrap();
         }
-        if let Some(caps) = re.captures(timecontrol_text) {
+        if let Some(caps) = RE.captures(timecontrol_text) {
             let initial = caps
                 .name("initial").unwrap().as_str()
                 .parse::<u64>().unwrap();
@@ -79,7 +79,7 @@ impl Ratings {
                 .name("increment").unwrap().as_str()
                 .parse::<u64>().unwrap();
             let total = initial + 40 * increment;
-            for (i, pool) in self.rating_pools.into_iter().enumerate() {
+            for (i, pool) in self.rating_pools.iter().enumerate() {
                 if pool.perf_type.speed.contains(&total) {
                     self.pool = Some(i);
                     return;
@@ -95,7 +95,7 @@ impl Ratings {
         let event_lower = event.to_lowercase();
         let casual_words = ["casual", "simul"];
         for word in &casual_words {
-            if event.contains(word) {
+            if event_lower.contains(word) {
                 self.rated = false;
                 self.casual += 1;
                 return
